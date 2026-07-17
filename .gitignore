@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Packaging
+build/
+dist/
+*.egg-info/
+*.manifest
+*.log
+
+# PyInstaller generated files
+*.toc
+*.pkg
+*.pyz
+warn-*.txt
+xref-*.html
+
+# Runtime and personal data
+alarms.json
+alarms.json.bak
+alarms.json.*.bak
+.alarms.*.tmp
+Alarm History/
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
