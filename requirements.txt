@@ -1,3 +1,3 @@
-customtkinter==5.2.2
+customtkinter==6.0.0
 Pillow>=10.4,<13
 pystray==0.19.5
