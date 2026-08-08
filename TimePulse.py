@@ -2,8 +2,6 @@ import customtkinter as ctk
 import calendar
 import json
 import os
-import copy
-import logging
 import hashlib
 import hmac
 import shutil
@@ -14,7 +12,6 @@ import uuid
 import sys
 import tempfile
 import ctypes
-import atexit
 from ctypes import wintypes
 import getpass
 
@@ -25,9 +22,10 @@ LRESULT = ctypes.c_ssize_t
 WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM)
 GWL_WNDPROC = -4
 NOTIFY_FOR_THIS_SESSION = 0
-APP_NAME = "TimePulse"
-APP_VERSION = "v1.0"
 DEFAULT_RINGTONE = "Soft_Arrival.wav"
+ERROR_ALREADY_EXISTS = 183
+# Preserve the legacy-compatible identifier so KRONOS and TimePulse cannot run together.
+MUTEX_NAME_PREFIX = "Local\\KRONOS_Alarm_"
 
 from xml.sax.saxutils import escape
 from pathlib import Path
@@ -37,7 +35,7 @@ from tkinter import messagebox
 import pystray
 from PIL import Image, ImageTk
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ---------------- Helpers ----------------
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
     try:
@@ -53,15 +51,56 @@ def executable_dir():
         return os.path.dirname(sys.executable)
     return APP_DIR
 
-# ── Config ────────────────────────────────────────────────────────────────────
+
+def get_single_instance_mutex_name():
+    """Return a stable, per-user mutex name in the current Windows session."""
+    account = f"{os.environ.get('USERDOMAIN', '')}\\{getpass.getuser()}"
+    account_hash = hashlib.sha256(account.encode("utf-8")).hexdigest()[:32]
+    return f"{MUTEX_NAME_PREFIX}{account_hash}"
+
+
+def acquire_single_instance_mutex():
+    """Return a mutex handle, False for an existing instance, or None on error."""
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.GetLastError.restype = wintypes.DWORD
+        kernel32.SetLastError.argtypes = [wintypes.DWORD]
+        kernel32.SetLastError(0)
+        handle = kernel32.CreateMutexW(None, False, get_single_instance_mutex_name())
+        last_error = kernel32.GetLastError()
+        if not handle:
+            print(f"Failed to create KRONOS single-instance mutex: {ctypes.WinError(last_error)}")
+            return None
+        if last_error == ERROR_ALREADY_EXISTS:
+            kernel32.CloseHandle(handle)
+            return False
+        return handle
+    except Exception as exc:
+        print(f"Failed to create KRONOS single-instance mutex: {exc}")
+        return None
+
+
+def release_single_instance_mutex(handle):
+    if not handle:
+        return
+    try:
+        ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception as exc:
+        print(f"Failed to release KRONOS single-instance mutex: {exc}")
+
+# ---------------- Configuration ----------------
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def resolve_icon_path():
-    """Return the bundled or external application icon path."""
+    """Return the bundled or executable-side TimePulse icon path."""
     search_roots = []
 
     if getattr(sys, "frozen", False):
-        # Prefer an external icon beside TimePulse.exe, then the bundled copy.
+        # Prefer an external asset beside TimePulse.exe, then the bundled copy.
         search_roots.append(os.path.dirname(sys.executable))
 
     search_roots.extend([
@@ -69,53 +108,28 @@ def resolve_icon_path():
         getattr(sys, "_MEIPASS", None),
     ])
 
-    icon_names = (
-        os.path.join("assets", "TimePulse.ico"),
-        "TimePulse.ico",
-        "newico.ico",  # Legacy compatibility.
-    )
-
     for root in search_roots:
         if not root:
             continue
-        for icon_name in icon_names:
-            candidate = os.path.join(root, icon_name)
-            if os.path.isfile(candidate):
-                return os.path.abspath(candidate)
+
+        candidate = os.path.join(root, "assets", "TimePulse.ico")
+        if os.path.isfile(candidate):
+            return os.path.abspath(candidate)
 
     return None
 
 ICON_PATH = resolve_icon_path()
+# For persistent data, we want it next to the EXE, not in the temp bundle dir
+if getattr(sys, 'frozen', False):
+    DATA_DIR = os.path.dirname(sys.executable)
+else:
+    DATA_DIR = APP_DIR
 
-def get_data_dir():
-    """Return a writable per-user data directory.
-
-    TIMEPULSE_DATA_DIR is intentionally supported for tests and portable
-    deployments. On Windows, persistent state lives under LOCALAPPDATA rather
-    than beside the executable, where writes commonly fail after installation.
-    """
-    override = os.environ.get("TIMEPULSE_DATA_DIR")
-    if override:
-        return os.path.abspath(os.path.expanduser(override))
-    if os.name == "nt":
-        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
-        if base:
-            return os.path.join(base, APP_NAME)
-    return os.path.join(Path.home(), f".{APP_NAME.lower()}")
-
-DATA_DIR = get_data_dir()
-DATA_FILE = os.path.join(DATA_DIR, "alarms.json")
+DATA_FILE  = os.path.join(DATA_DIR, "alarms.json")
 HISTORY_DIR = os.path.join(DATA_DIR, "Alarm History")
+if not os.path.exists(HISTORY_DIR):
+    os.makedirs(HISTORY_DIR)
 HISTORY_FILE = os.path.join(HISTORY_DIR, "alarm_history.txt")
-LOG_FILE = os.path.join(DATA_DIR, "TimePulse.log")
-
-os.makedirs(DATA_DIR, exist_ok=True)
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
-LOGGER = logging.getLogger(APP_NAME)
 DEFAULT_HASH = None # None means password protection is disabled
 PASSWORD_HASH_PREFIX = "pbkdf2_sha256"
 PASSWORD_HASH_ITERATIONS = 600_000
@@ -150,7 +164,7 @@ _native_icon_handles = {}
 
 def apply_window_icon(window):
     """
-    Apply newico.ico to a Tk/CustomTkinter root window or popup.
+    Apply assets/TimePulse.ico to a Tk/CustomTkinter root window or popup.
 
     WM_SETICON is used for the real Windows title-bar icon. Tk iconphoto and
     iconbitmap remain as fallbacks.
@@ -160,7 +174,7 @@ def apply_window_icon(window):
     if not ICON_PATH:
         if not _icon_warning_shown:
             print(
-                "Application icon not found. Expected assets/TimePulse.ico in the app folder."
+                "Application icon not found. Expected assets/TimePulse.ico."
             )
             _icon_warning_shown = True
         return
@@ -258,7 +272,7 @@ def apply_window_icon(window):
             errors.append(f"iconbitmap failed: {exc}")
 
         if len(errors) == 3 and not _icon_warning_shown:
-            print("Failed to apply application icon: " + " | ".join(errors))
+            print("Failed to apply assets/TimePulse.ico: " + " | ".join(errors))
             _icon_warning_shown = True
 
     # Apply after the native window is fully created. The delayed pass is
@@ -277,119 +291,90 @@ def log_history_event(alarm, event):
     log_entry = f"{timestamp} - {label} ({event})\n"
 
     try:
-        os.makedirs(HISTORY_DIR, exist_ok=True)
-        with open(HISTORY_FILE, "a", encoding="utf-8") as f:
+        with open(HISTORY_FILE, "a") as f:
             f.write(log_entry)
     except Exception as e:
-        LOGGER.exception("Failed to log history event: %s", e)
-
-LAST_LOAD_ERROR = None
-
-def _normalize_data(data):
-    """Validate and normalize the persisted model without changing features."""
-    if not isinstance(data, dict):
-        raise ValueError("The data root must be an object.")
-    alarms = data.get("alarms")
-    if not isinstance(alarms, list):
-        raise ValueError("'alarms' must be a list.")
-    password = data.get("password")
-    if password is not None and not isinstance(password, str):
-        raise ValueError("'password' must be null or a string.")
-
-    normalized = {"password": password, "alarms": []}
-    seen_ids = set()
-    now = datetime.now()
-
-    for index, raw_alarm in enumerate(alarms):
-        if not isinstance(raw_alarm, dict):
-            raise ValueError(f"Alarm #{index + 1} must be an object.")
-        alarm = dict(raw_alarm)
-        alarm_id = alarm.get("id")
-        if not isinstance(alarm_id, str) or not alarm_id.strip() or alarm_id in seen_ids:
-            alarm_id = str(uuid.uuid4())
-            alarm["id"] = alarm_id
-        seen_ids.add(alarm_id)
-
-        if "datetime" not in alarm:
-            time_value = alarm.get("time")
-            if not isinstance(time_value, str):
-                raise ValueError(f"Alarm {alarm_id} has no valid time.")
-            date_value = alarm.get("date", now.strftime("%Y-%m-%d"))
-            alarm["date"] = date_value
-            alarm["datetime"] = f"{date_value}T{time_value}:00"
-
-        alarm_dt = parse_alarm_datetime(alarm.get("datetime"))
-        if alarm_dt is None:
-            raise ValueError(f"Alarm {alarm_id} has an invalid datetime.")
-
-        # Keep existing valid records byte-for-byte compatible where possible.
-        # Missing optional fields are handled by callers through safe defaults.
-        if "date" in alarm:
-            alarm["date"] = alarm_dt.strftime("%Y-%m-%d")
-        if "time" in alarm:
-            alarm["time"] = alarm_dt.strftime("%H:%M")
-        alarm["datetime"] = alarm_dt.strftime("%Y-%m-%dT%H:%M:%S")
-        repeat = str(alarm.get("repeat", "none")).lower()
-        if repeat not in {"none", "daily", "weekly", "monthly"}:
-            raise ValueError(f"Alarm {alarm_id} has an invalid repeat value.")
-        if "repeat" in alarm:
-            alarm["repeat"] = repeat
-        if "enabled" in alarm:
-            alarm["enabled"] = bool(alarm["enabled"])
-        if "status" in alarm:
-            alarm["status"] = str(alarm["status"])
-        if "label" in alarm:
-            alarm["label"] = str(alarm["label"])
-        if "ringtone" in alarm:
-            alarm["ringtone"] = str(alarm["ringtone"])
-
-        if repeat == "monthly":
-            repeat_day = alarm.get("repeat_day", alarm_dt.day)
-            try:
-                repeat_day = int(repeat_day)
-            except (TypeError, ValueError):
-                repeat_day = alarm_dt.day
-            alarm["repeat_day"] = min(31, max(1, repeat_day))
-
-        if repeat == "none" and alarm.get("enabled", True) and alarm_dt < now:
-            alarm["enabled"] = False
-            alarm["status"] = "missed"
-
-        normalized["alarms"].append(alarm)
-
-    return normalized
+        print(f"Failed to log event: {e}")
 
 def load_data():
-    global LAST_LOAD_ERROR
-    LAST_LOAD_ERROR = None
     default_data = {"password": DEFAULT_HASH, "alarms": []}
     if not os.path.exists(DATA_FILE):
         return default_data
-
+    
     try:
-        with open(DATA_FILE, "r", encoding="utf-8") as file_handle:
-            raw_data = json.load(file_handle)
-        data = _normalize_data(raw_data)
-        if data != raw_data and not save_data(data):
-            raise OSError("Normalized alarm data could not be saved.")
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        
+        # Validate structure
+        if not isinstance(data, dict) or "password" not in data or "alarms" not in data:
+            raise ValueError("Invalid structure")
+        
+
+        # Migrate existing alarms to have stable IDs if missing
+        mutated = False
+        if isinstance(data.get("alarms"), list):
+            now = datetime.now()
+            for alarm in data["alarms"]:
+                if not isinstance(alarm, dict): continue
+                if "id" not in alarm:
+                    alarm["id"] = str(uuid.uuid4())
+                    mutated = True
+                # Normalize to new Date+Time format
+                if "datetime" not in alarm:
+                    if "time" in alarm:
+                        today_str = datetime.now().strftime("%Y-%m-%d")
+                        alarm["date"] = alarm.get("date", today_str)
+                        alarm["datetime"] = f"{alarm['date']}T{alarm['time']}:00"
+                    else:
+                        alarm["datetime"] = datetime.now().strftime("%Y-%m-%dT%H:%M:00")
+                    
+                    if "status" not in alarm:
+                        alarm["status"] = "scheduled"
+                    if "repeat" not in alarm:
+                        alarm["repeat"] = "none"
+                    if "created_at" not in alarm:
+                        alarm["created_at"] = datetime.now().isoformat()
+                    mutated = True
+
+                # A stale one-time alarm should remain visible as missed,
+                # rather than firing immediately when the app starts.
+                try:
+                    alarm_dt = datetime.fromisoformat(alarm.get("datetime", ""))
+                    is_past_one_time = (
+                        str(alarm.get("repeat", "none")).lower() == "none"
+                        and alarm.get("enabled", True)
+                        and alarm_dt < now
+                    )
+                except (TypeError, ValueError):
+                    is_past_one_time = False
+
+                if is_past_one_time:
+                    alarm["enabled"] = False
+                    alarm["status"] = "missed"
+                    log_history_event(
+                        alarm,
+                        "Missed - skipped because its scheduled time was in the past",
+                    )
+                    mutated = True
+
+        if mutated:
+            save_data(data)
+            
         return data
-    except (json.JSONDecodeError, OSError, ValueError, TypeError) as exc:
-        LAST_LOAD_ERROR = str(exc)
-        LOGGER.exception("Failed to load alarm data: %s", exc)
+        
+    except (json.JSONDecodeError, ValueError, Exception) as e:
+        # Backup corrupt file
         try:
-            backup_path = (
-                f"{DATA_FILE}.{datetime.now().strftime('%Y%m%d_%H%M%S')}.bak"
-            )
+            backup_path = f"{DATA_FILE}.{datetime.now().strftime('%Y%m%d_%H%M%S')}.bak"
             if os.path.exists(DATA_FILE):
                 shutil.copy2(DATA_FILE, backup_path)
-        except OSError as backup_exc:
-            LOGGER.exception("Failed to back up unreadable data: %s", backup_exc)
+        except:
+            pass
         return default_data
 
 def save_data(data):
     temp_path = None
     try:
-        os.makedirs(DATA_DIR, exist_ok=True)
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
@@ -405,19 +390,14 @@ def save_data(data):
 
         if os.path.exists(DATA_FILE):
             try:
-                for suffix in range(3, 1, -1):
-                    older = f"{DATA_FILE}.bak.{suffix - 1}"
-                    newer = f"{DATA_FILE}.bak.{suffix}"
-                    if os.path.exists(older):
-                        os.replace(older, newer)
-                shutil.copy2(DATA_FILE, f"{DATA_FILE}.bak.1")
-            except OSError as backup_error:
-                LOGGER.warning("Failed to rotate data backup: %s", backup_error)
+                shutil.copy2(DATA_FILE, f"{DATA_FILE}.bak")
+            except Exception as backup_error:
+                print(f"Failed to back up data: {backup_error}")
 
         os.replace(temp_path, DATA_FILE)
         return True
     except Exception as e:
-        LOGGER.exception("Failed to save data: %s", e)
+        print(f"Failed to save data: {e}")
         if temp_path and os.path.exists(temp_path):
             try:
                 os.remove(temp_path)
@@ -425,37 +405,10 @@ def save_data(data):
                 pass
         return False
 
-
-_SINGLE_INSTANCE_HANDLE = None
-
-def acquire_single_instance():
-    """Prevent concurrent processes from corrupting shared alarm state."""
-    global _SINGLE_INSTANCE_HANDLE
-    if os.name != "nt":
-        return True
-    kernel32 = ctypes.windll.kernel32
-    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
-    kernel32.CreateMutexW.restype = wintypes.HANDLE
-    handle = kernel32.CreateMutexW(None, False, "Local\\TimePulse.SingleInstance")
-    if not handle:
-        raise ctypes.WinError(ctypes.get_last_error())
-    ERROR_ALREADY_EXISTS = 183
-    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
-        kernel32.CloseHandle(handle)
-        return False
-    _SINGLE_INSTANCE_HANDLE = handle
-    atexit.register(release_single_instance)
-    return True
-
-def release_single_instance():
-    global _SINGLE_INSTANCE_HANDLE
-    if _SINGLE_INSTANCE_HANDLE and os.name == "nt":
-        ctypes.windll.kernel32.CloseHandle(_SINGLE_INSTANCE_HANDLE)
-        _SINGLE_INSTANCE_HANDLE = None
-
-# ── Windows Startup Logic ─────────────────────────────────────────────────────
+# ---------------- Windows Startup Logic ----------------
 STARTUP_FILE_NAME = "TimePulse Startup.cmd"
-LEGACY_TASK_NAMES = ("TimePulse_AutoStart", "TimePulse_AutoStart_Login")
+LEGACY_STARTUP_FILE_NAMES = ("Alarm App Startup.cmd",)
+LEGACY_TASK_NAMES = ("AlarmApp_AutoStart", "AlarmApp_AutoStart_Login")
 
 def get_app_launch_details():
     """Return the executable and arguments used by the Windows Startup entry."""
@@ -499,16 +452,35 @@ def is_auto_start_enabled():
     return bool(startup_file and os.path.isfile(startup_file))
 
 
+def _remove_legacy_startup_files():
+    """Remove only exact Startup-folder filenames created by earlier app versions."""
+    startup_dir = get_startup_folder()
+    if not startup_dir:
+        return
+
+    for filename in LEGACY_STARTUP_FILE_NAMES:
+        legacy_path = os.path.join(startup_dir, filename)
+        try:
+            if os.path.isfile(legacy_path):
+                os.remove(legacy_path)
+        except Exception as exc:
+            print(f"Failed to remove legacy startup entry '{filename}': {exc}")
+
+
 def _remove_legacy_scheduled_tasks():
     """Best-effort cleanup of tasks created by earlier app versions."""
     for task_name in LEGACY_TASK_NAMES:
         try:
-            subprocess.run(
+            result = subprocess.run(
                 ["schtasks", "/Delete", "/TN", task_name, "/F"],
                 capture_output=True,
                 text=True,
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
+            if result.returncode:
+                details = (result.stderr or result.stdout or "").strip()
+                if "cannot find" not in details.lower() and "not exist" not in details.lower():
+                    print(f"Failed to remove legacy startup task '{task_name}': {details or result.returncode}")
         except Exception as exc:
             print(f"Failed to remove legacy startup task '{task_name}': {exc}")
 
@@ -546,10 +518,27 @@ def enable_auto_start():
 
 def ensure_login_auto_start():
     """Ensure the app starts automatically at Windows sign-in."""
+    _remove_legacy_startup_files()
     _remove_legacy_scheduled_tasks()
 
-    if is_auto_start_enabled():
-        return True
+    startup_file = get_startup_file_path()
+    if not startup_file:
+        return False
+
+    executable, arguments = get_app_launch_details()
+    expected = f'@echo off\r\nstart "" "{executable}"'
+    if arguments:
+        expected += f" {arguments}"
+    expected += "\r\nexit /b 0\r\n"
+
+    if os.path.isfile(startup_file):
+        try:
+            with open(startup_file, "r", encoding="utf-8", newline="") as f:
+                content = f.read()
+            if content == expected:
+                return True
+        except Exception:
+            pass
 
     return enable_auto_start()
 
@@ -717,7 +706,7 @@ def next_repeat_datetime(alarm, now=None):
         candidate = occurrence_after_months(months_ahead + 1)
     return candidate
 
-# ── Audio Manager and Ringtone Selector ───────────────────────────────────────
+# ---------------- Audio Manager and Ringtone Selector ----------------
 class AudioManager:
     def __init__(self, app):
         self.app = app
@@ -1127,7 +1116,7 @@ class RingtoneSelector(ctk.CTkFrame):
         super().destroy()
 
 
-# ── Main App ──────────────────────────────────────────────────────────────────
+# ---------------- Main App ----------------
 class NumberStepper(ctk.CTkFrame):
     def __init__(self, master, min_value, max_value, value, width=98, height=34, command=None):
         super().__init__(master, fg_color="transparent")
@@ -1362,10 +1351,10 @@ class DatePickerField(ctk.CTkFrame):
         self.previous_grab = None
 
 
-class TimePulse(ctk.CTk):
+class AlarmApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title(f"{APP_NAME} {APP_VERSION}")
+        self.title("TimePulse")
         width, height = 430, 650
         self.geometry(f"{width}x{height}")
         center_window(self, width, height)
@@ -1387,6 +1376,14 @@ class TimePulse(ctk.CTk):
         self._alarm_check_after_id = None
         self._clock_after_id = None
         self._shutting_down = False
+        self._instance_mutex_handle = None
+        self.tray = None
+        self._tray_thread = None
+        self._tray_ready = False
+        self._tray_starting = False
+        self._tray_ready_event = threading.Event()
+        self._tray_failed = False
+        self._hide_requested = False
         self.tab_frames = {}
         self.auto_sync_active = True # New: Auto-sync alarm setter with clock
         self.active_alarm_ids = set() # Track alarms currently firing
@@ -1407,20 +1404,17 @@ class TimePulse(ctk.CTk):
         self._build_settings_tab()
         self._show_tab("alarms")
         self._start_clock()
-        if LAST_LOAD_ERROR:
-            self.after(250, lambda: messagebox.showwarning(
-                "Alarm Data Recovery",
-                "TimePulse could not safely load the saved data and opened with an "
-                "empty recovery state. A timestamped backup was preserved.\n\n"
-                f"Reason: {LAST_LOAD_ERROR}",
-                parent=self,
-            ))
 
     def _deferred_startup(self):
         self._setup_tray()
         self._setup_session_notifications()
         self._start_alarm_checker()
 
+        if not ensure_login_auto_start():
+            print(
+                "Automatic login startup could not be enabled. "
+                "The app will continue running normally."
+            )
 
     def get_ringtones_dir(self):
         dirs = self.get_ringtone_dirs()
@@ -1570,7 +1564,7 @@ class TimePulse(ctk.CTk):
         
         txt_grp = ctk.CTkFrame(hdr, fg_color="transparent")
         txt_grp.pack(side="left", padx=(16, 0), pady=7)
-        ctk.CTkLabel(txt_grp, text=APP_NAME, font=("Segoe UI Black", 14, "bold"), text_color=TEXT).pack(anchor="w")
+        ctk.CTkLabel(txt_grp, text="TimePulse", font=("Segoe UI Black", 14, "bold"), text_color=TEXT).pack(anchor="w")
         
         dev_lbl = ctk.CTkFrame(txt_grp, fg_color="transparent")
         dev_lbl.pack(anchor="w")
@@ -1592,29 +1586,86 @@ class TimePulse(ctk.CTk):
             self.theme_btn.configure(text="Dark")
 
     def _setup_tray(self):
+        if self._shutting_down or self._tray_ready:
+            return self._tray_ready
+        if self._tray_starting:
+            return self._tray_ready_event.wait(1)
         if not ICON_PATH:
             print("System tray icon disabled because no icon file was found.")
-            return
+            return False
 
         try:
+            self._tray_starting = True
+            self._tray_ready_event.clear()
+            self._tray_failed = False
             image = Image.open(ICON_PATH)
             menu = pystray.Menu(
                 pystray.MenuItem("Show", self._show_window, default=True),
                 pystray.MenuItem("Exit", self._quit_app)
             )
-            self.tray = pystray.Icon("Kronos", image, "KRONOS Alarm", menu)
-            threading.Thread(target=self.tray.run, daemon=True).start()
+            self.tray = pystray.Icon("TimePulse", image, "TimePulse Alarm", menu)
+            self._tray_image = image
+
+            tray = self.tray
+
+            def tray_setup(icon):
+                if self._shutting_down:
+                    icon.stop()
+                    return
+                icon.visible = True
+                self._tray_ready_event.set()
+
+            def run_tray():
+                try:
+                    tray.run(setup=tray_setup)
+                except Exception as exc:
+                    self._tray_failed = True
+                    self._tray_ready_event.set()
+                    print(f"Tray error: {exc}")
+
+            self._tray_thread = threading.Thread(target=run_tray, daemon=True)
+            self._tray_thread.start()
+            if self._tray_ready_event.wait(1) and not self._tray_failed:
+                self._tray_ready = True
+                return True
+
+            if self.tray:
+                self.tray.stop()
+            self.tray = None
+            return False
         except Exception as e:
+            self.tray = None
             print(f"Tray error: {e}")
+            return False
+        finally:
+            self._tray_starting = False
 
     def _withdraw_window(self):
         if hasattr(self, 'audio_manager'):
             self.audio_manager.stop_preview()
+        self._hide_requested = True
+        if not self._tray_ready and not self._setup_tray():
+            # Do not leave the application inaccessible when the tray cannot
+            # be created (for example, a missing packaged icon).
+            self._hide_requested = False
+            self.deiconify()
+            self.lift()
+            return
         self.withdraw()
 
     def _show_window(self):
-        self.after(0, self.deiconify)
-        self.after(0, self.focus_force)
+        def restore_window():
+            if self._shutting_down or not self.winfo_exists():
+                return
+            self._hide_requested = False
+            self.deiconify()
+            self.lift()
+            self.focus_force()
+
+        try:
+            self.after(0, restore_window)
+        except Exception:
+            pass
 
     def _quit_app(self):
         try:
@@ -1623,13 +1674,18 @@ class TimePulse(ctk.CTk):
             self._quit_app_main_thread()
 
     def _quit_app_main_thread(self):
-        if hasattr(self, 'tray'):
-            self.tray.stop()
+        if self._shutting_down:
+            return
         self._shutdown_cleanup()
-        release_single_instance()
+        if self.tray:
+            self.tray.stop()
+            self.tray = None
+        self._tray_ready = False
         self.destroy()
 
     def _shutdown_cleanup(self):
+        if self._shutting_down:
+            return
         self._shutting_down = True
         for timer_id in (self._alarm_check_after_id, self._clock_after_id):
             if timer_id:
@@ -1723,13 +1779,13 @@ class TimePulse(ctk.CTk):
 
             # Update Tray Tooltip
             try:
-                tray_msg = f"{APP_NAME}: Next alarm in {int(min_diff // 60)} minutes"
+                tray_msg = f"TimePulse: Next alarm in {int(min_diff // 60)} minutes"
                 self.tray.title = tray_msg
             except:
                 pass
         else:
             self.next_alarm_lbl.configure(text="No upcoming alarms")
-            try: self.tray.title = f"{APP_NAME}: No alarms"
+            try: self.tray.title = "TimePulse: No alarms"
             except: pass
     def _build_tabs(self):
         bar = ctk.CTkFrame(self, fg_color=CARD, corner_radius=10, height=42)
@@ -1758,8 +1814,7 @@ class TimePulse(ctk.CTk):
             self._refresh_alarm_list()
         elif key == "settings":
             self._refresh_password_controls()
-
-    # ── Alarms Tab ───────────────────────────────────────────────────────────
+    # ---------------- Alarms Tab ----------------
     def _build_alarm_tab(self):
         f = ctk.CTkFrame(self, fg_color="transparent")
         self.tab_frames["alarms"] = f
@@ -2122,10 +2177,8 @@ class TimePulse(ctk.CTk):
         }
         
         with self.data_lock:
-            snapshot = copy.deepcopy(self.data)
             self.data["alarms"].append(alarm)
-            if not self._persist_or_restore(snapshot):
-                return
+            save_data(self.data)
             self._log_event(alarm, "Created")
         messagebox.showinfo("Timer Set", f"Alarm set for {target.strftime('%Y-%m-%d %I:%M %p')}")
         self._refresh_alarm_list()
@@ -2261,10 +2314,8 @@ class TimePulse(ctk.CTk):
             "created_at": datetime.now().isoformat()
         }
         with self.data_lock:
-            snapshot = copy.deepcopy(self.data)
             self.data["alarms"].append(alarm)
-            if not self._persist_or_restore(snapshot):
-                return
+            save_data(self.data)
             self._log_event(alarm, "Created")
         self.label_var.set("")
         self.ringtone_var.set(DEFAULT_RINGTONE)
@@ -2308,9 +2359,8 @@ class TimePulse(ctk.CTk):
         with self.data_lock:
             current_hash = self.data.get("password")
             if _is_legacy_sha256_hash(current_hash):
-                snapshot = copy.deepcopy(self.data)
                 self.data["password"] = upgraded_hash
-                self._persist_or_restore(snapshot)
+                save_data(self.data)
 
     def _verify_configured_password(self, password):
         current_hash = self.data.get("password")
@@ -2342,10 +2392,8 @@ class TimePulse(ctk.CTk):
                     if alarm_id in self.active_alarm_ids:
                         self.audio_manager.stop_alarm()
                         self.active_alarm_ids.discard(alarm_id)
-                    snapshot = copy.deepcopy(self.data)
                     self.data["alarms"].remove(alarm)
-                    if not self._persist_or_restore(snapshot):
-                        return
+                    save_data(self.data)
                     self._log_event(alarm, "Deleted")
                     break
         self._refresh_alarm_list()
@@ -2354,15 +2402,11 @@ class TimePulse(ctk.CTk):
         with self.data_lock:
             for alarm in list(self.data.get("alarms", [])):
                 if alarm.get("id") == alarm_id:
-                    snapshot = copy.deepcopy(self.data)
                     alarm["enabled"] = not alarm.get("enabled", True)
                     if not alarm["enabled"] and alarm_id in self.active_alarm_ids:
                         self.audio_manager.stop_alarm()
                         self.active_alarm_ids.discard(alarm_id)
-                    if not self._persist_or_restore(snapshot):
-                        if switch_var is not None:
-                            switch_var.set(not switch_var.get())
-                        return
+                    save_data(self.data)
                     status = "Enabled" if alarm["enabled"] else "Disabled"
                     self._log_event(alarm, f"Toggled {status}")
                     break
@@ -2392,8 +2436,7 @@ class TimePulse(ctk.CTk):
                                 command=lambda m=mins: self._add_timer_alarm(m))
             btn.grid(row=i//2, column=i%2, padx=4, pady=4, sticky="ew")
         grid.columnconfigure((0, 1), weight=1)
-
-    # ── Settings Tab ─────────────────────────────────────────────────────────
+    # ---------------- Settings Tab ----------------
     def _build_settings_tab(self):
         f = ctk.CTkScrollableFrame(self, fg_color="transparent", scrollbar_button_color=BORDER)
         self.tab_frames["settings"] = f
@@ -2436,45 +2479,40 @@ class TimePulse(ctk.CTk):
         self.password_remove_btn.pack(side="left", expand=True, fill="x", padx=(4,0))
         self._refresh_password_controls()
 
+
+        # Automatic login startup is always enabled for this application.
         as_card = ctk.CTkFrame(f, fg_color=CARD, corner_radius=12)
         as_card.pack(fill="x", pady=(0, 8))
+
         as_text = ctk.CTkFrame(as_card, fg_color="transparent")
         as_text.pack(side="left", fill="x", expand=True, padx=14, pady=10)
+
         ctk.CTkLabel(
-            as_text, text="Automatic Start", font=("Segoe UI", 13, "bold"),
+            as_text,
+            text="Automatic Start",
+            font=("Segoe UI", 13, "bold"),
             text_color=TEXT
         ).pack(anchor="w")
+
         ctk.CTkLabel(
-            as_text, text="Start TimePulse when you sign in to Windows.",
-            font=("Segoe UI", 10), text_color=SUBTEXT
+            as_text,
+            text="Enabled through your personal Windows Startup folder.",
+            font=("Segoe UI", 10),
+            text_color=SUBTEXT
         ).pack(anchor="w", pady=(3, 0))
-        self.auto_start_var = ctk.BooleanVar(value=is_auto_start_enabled())
-        ctk.CTkSwitch(
-            as_card, text="", variable=self.auto_start_var,
-            command=self._toggle_auto_start
+
+        ctk.CTkLabel(
+            as_card,
+            text="Enabled",
+            font=("Segoe UI", 10, "bold"),
+            text_color=SUCCESS,
+            fg_color=MUTED,
+            corner_radius=7,
+            padx=10,
+            pady=5
         ).pack(side="right", padx=14, pady=12)
 
 
-    def _toggle_auto_start(self):
-        requested = bool(self.auto_start_var.get())
-        succeeded = enable_auto_start() if requested else disable_auto_start()
-        if not succeeded:
-            self.auto_start_var.set(not requested)
-            messagebox.showerror(
-                "Automatic Start",
-                "The Windows startup setting could not be changed. Check permissions."
-            )
-
-    def _persist_or_restore(self, snapshot, parent=None):
-        if save_data(self.data):
-            return True
-        self.data = snapshot
-        messagebox.showerror(
-            "Save Failed",
-            "Your change was not saved. Check that the data folder is writable.",
-            parent=parent,
-        )
-        return False
 
     def _refresh_password_controls(self):
         password_enabled = self.data.get("password") is not None
@@ -2531,10 +2569,8 @@ class TimePulse(ctk.CTk):
             return
 
         was_enabled = current_hash is not None
-        snapshot = copy.deepcopy(self.data)
         self.data["password"] = hash_password(new)
-        if not self._persist_or_restore(snapshot):
-            return
+        save_data(self.data)
         for e in (self.old_pw, self.new_pw, self.confirm_pw): e.delete(0, "end")
         self._refresh_password_controls()
         success_message = (
@@ -2568,10 +2604,8 @@ class TimePulse(ctk.CTk):
             return
 
         if messagebox.askyesno("Confirm", "Are you sure you want to disable password protection?"):
-            snapshot = copy.deepcopy(self.data)
             self.data["password"] = None
-            if not self._persist_or_restore(snapshot):
-                return
+            save_data(self.data)
             for e in (self.old_pw, self.new_pw, self.confirm_pw): e.delete(0, "end")
             self._refresh_password_controls()
             messagebox.showinfo("Success", "Password protection disabled.")
@@ -2649,8 +2683,7 @@ class TimePulse(ctk.CTk):
 
     def _log_event(self, alarm, event):
         log_history_event(alarm, event)
-
-    # ── Alarm Checker ────────────────────────────────────────────────────────
+    # ---------------- Alarm Checker ----------------
     def _start_alarm_checker(self):
         if self._alarm_check_running:
             return
@@ -2693,7 +2726,6 @@ class TimePulse(ctk.CTk):
                     # Fire!
                     self.active_alarm_ids.add(alarm_id)
                     triggered.append(dict(alarm))
-                    break  # Present due alarms independently and in order.
 
         if triggered:
             try:
@@ -2758,8 +2790,7 @@ class TimePulse(ctk.CTk):
 
         def dismiss(is_auto=False):
             nonlocal dismissed_flag, auto_lock_timer
-            if dismissed_flag[0]:
-                return
+            if dismissed_flag[0]: return
             dismissed_flag[0] = True
 
             if auto_lock_timer:
@@ -2771,93 +2802,50 @@ class TimePulse(ctk.CTk):
 
             self.audio_manager.stop_alarm()
 
-            with self.data_lock:
-                snapshot = copy.deepcopy(self.data)
-                changed_alarms = []
-                try:
-                    for triggered_alarm in triggered:
-                        alarm_id = triggered_alarm.get("id")
-                        for alarm in self.data.get("alarms", []):
-                            if alarm.get("id") != alarm_id:
-                                continue
-
-                            repeat = str(alarm.get("repeat", "none")).lower()
-                            next_dt = (
-                                next_repeat_datetime(alarm)
-                                if repeat != "none"
-                                else None
-                            )
-                            if next_dt:
-                                alarm["date"] = next_dt.strftime("%Y-%m-%d")
-                                alarm["time"] = next_dt.strftime("%H:%M")
-                                alarm["datetime"] = next_dt.strftime(
-                                    "%Y-%m-%dT%H:%M:%S"
-                                )
-                                if repeat == "monthly":
-                                    original_dt = parse_alarm_datetime(
-                                        alarm.get("snooze_original_datetime")
-                                        or triggered_alarm.get("datetime")
-                                    )
-                                    alarm.setdefault(
-                                        "repeat_day",
-                                        original_dt.day if original_dt else next_dt.day,
-                                    )
-                                alarm["enabled"] = True
-                                alarm["status"] = "scheduled"
-                            else:
-                                alarm["enabled"] = False
-                                alarm["status"] = "completed"
-
-                            alarm["snoozed"] = False
-                            alarm.pop("snooze_original_datetime", None)
-                            changed_alarms.append(dict(alarm))
-                            break
-                except Exception as exc:
-                    self.data = snapshot
-                    dismissed_flag[0] = False
-                    LOGGER.exception("Failed to calculate dismissal state: %s", exc)
-                    status_lbl.configure(text="Could not update alarm state.")
-                    messagebox.showerror(
-                        "Dismiss Failed",
-                        "The alarm state could not be updated safely.",
-                        parent=win,
-                    )
-                    return
-
-                if not self._persist_or_restore(snapshot, parent=win):
-                    dismissed_flag[0] = False
-                    status_lbl.configure(text="Could not save alarm state.")
-                    return
-
-            # Persist first so a successful workstation lock cannot leave the
-            # alarm overdue. If locking fails, restore the previous state.
+            # Keep the popup and alarm state intact if locking fails.
             if not lock_screen():
-                with self.data_lock:
-                    current = copy.deepcopy(self.data)
-                    self.data = snapshot
-                    if not save_data(self.data):
-                        self.data = current
-                        LOGGER.error(
-                            "Workstation lock and alarm-state rollback both failed."
-                        )
                 dismissed_flag[0] = False
                 status_lbl.configure(text="Screen lock failed. Please try again.")
-                self.audio_manager.play_alarm(
-                    self.resolve_ringtone_path(
-                        triggered[0].get("ringtone", DEFAULT_RINGTONE)
-                    )
-                )
                 auto_lock_timer = win.after(30000, lambda: dismiss(True))
                 messagebox.showerror(
                     "Lock Failed",
-                    "Failed to lock workstation. The alarm remains active.",
+                    "Failed to lock workstation. The alarm has not been dismissed.",
                     parent=win,
                 )
                 return
 
-            event = "Auto-Locked" if is_auto else "Dismissed"
-            for alarm in changed_alarms:
-                self._log_event(alarm, event)
+            with self.data_lock:
+                for t in triggered:
+                    alarm_id = t.get("id")
+                    for a in list(self.data.get("alarms", [])):
+                        if a.get("id") == alarm_id:
+                            event = "Auto-Locked" if is_auto else "Dismissed"
+                            self._log_event(a, event)
+
+                            repeat = str(a.get("repeat", "none")).lower()
+                            next_dt = next_repeat_datetime(a) if repeat != "none" else None
+                            if next_dt:
+                                a["date"] = next_dt.strftime("%Y-%m-%d")
+                                a["time"] = next_dt.strftime("%H:%M")
+                                a["datetime"] = next_dt.strftime("%Y-%m-%dT%H:%M:%S")
+                                if repeat == "monthly":
+                                    a.setdefault(
+                                        "repeat_day",
+                                        parse_alarm_datetime(
+                                            a.get("snooze_original_datetime")
+                                            or t.get("datetime")
+                                        ).day,
+                                    )
+                                a["enabled"] = True
+                                a["status"] = "scheduled"
+                            else:
+                                a["enabled"] = False
+                                a["status"] = "completed"
+
+                            a["snoozed"] = False
+                            a.pop("snooze_original_datetime", None)
+                            break
+                save_data(self.data)
 
             self._release_active_alarms(triggered)
             try:
@@ -2865,6 +2853,7 @@ class TimePulse(ctk.CTk):
             except Exception:
                 pass
             self._refresh_alarm_list()
+
 
         def snooze():
             nonlocal dismissed_flag
@@ -2879,12 +2868,11 @@ class TimePulse(ctk.CTk):
             snooze_dt = now_plus_3.strftime("%Y-%m-%dT%H:%M:00")
             
             with self.data_lock:
-                snapshot = copy.deepcopy(self.data)
-                changed_alarms = []
                 for t in triggered:
                     alarm_id = t.get("id")
                     for a in list(self.data.get("alarms", [])):
                         if a.get("id") == alarm_id:
+                            self._log_event(a, "Snoozed")
                             if not a.get("snoozed"):
                                 a["snooze_original_datetime"] = a.get("datetime")
                             a["date"] = snooze_date
@@ -2893,13 +2881,8 @@ class TimePulse(ctk.CTk):
                             a["snoozed"] = True
                             a["enabled"] = True
                             a["status"] = "scheduled"
-                            changed_alarms.append(dict(a))
                             break
-                if not self._persist_or_restore(snapshot, parent=win):
-                    dismissed_flag[0] = False
-                    return
-            for alarm in changed_alarms:
-                self._log_event(alarm, "Snoozed")
+                save_data(self.data)
             self._refresh_alarm_list()
 
             self._release_active_alarms(triggered)
@@ -2913,22 +2896,24 @@ class TimePulse(ctk.CTk):
         btn_row.pack(fill="x", padx=36, pady=14)
 
         if not is_snoozed:
+            btn_row.grid_columnconfigure(0, weight=1)
+            btn_row.grid_columnconfigure(1, weight=1)
             ctk.CTkButton(btn_row, text="Snooze (3m)", fg_color=ACCENT, hover_color="#3730A3",
                           text_color=ON_ACCENT, font=("Segoe UI", 15, "bold"), height=50, corner_radius=11,
-                          command=snooze).pack(side="left", expand=True, fill="x", padx=(0, 5))
+                          command=snooze).grid(row=0, column=0, padx=(0, 5), sticky="ew")
 
-            ctk.CTkButton(btn_row, text="OK - Lock", fg_color=ACCENT2, hover_color="#BE123C",
+            ctk.CTkButton(btn_row, text="Lock Now", fg_color=ACCENT2, hover_color="#BE123C",
                           text_color=ON_ACCENT, font=("Segoe UI", 15, "bold"), height=50, corner_radius=11,
-                          command=lambda: dismiss(False)).pack(side="left", expand=True, fill="x", padx=(5, 0))
+                          command=lambda: dismiss(False)).grid(row=0, column=1, padx=(5, 0), sticky="ew")
         else:
-            ctk.CTkButton(btn_row, text="OK - Lock Now", fg_color=ACCENT2, hover_color="#BE123C",
+            ctk.CTkButton(btn_row, text="Lock Now", fg_color=ACCENT2, hover_color="#BE123C",
                           text_color=ON_ACCENT, font=("Segoe UI", 15, "bold"), height=50, corner_radius=11,
                           command=lambda: dismiss(False)).pack(fill="x")
         
         auto_lock_timer = win.after(30000, lambda: dismiss(True))
 
 
-# ── Password Dialog ───────────────────────────────────────────────────────────
+# ---------------- Password Dialog ----------------
 class PwDialog(ctk.CTkToplevel):
     def __init__(
         self,
@@ -2992,7 +2977,7 @@ class PwDialog(ctk.CTkToplevel):
         self.destroy()
 
 
-# ── Edit Dialog ───────────────────────────────────────────────────────────────
+# ---------------- Edit Dialog ----------------
 class EditDialog(ctk.CTkToplevel):
     def __init__(self, parent, data, alarm_id):
         super().__init__(parent)
@@ -3092,7 +3077,6 @@ class EditDialog(ctk.CTkToplevel):
                     alarm = a
                     break
             if alarm:
-                snapshot = copy.deepcopy(self.data)
                 rt_file = self.master.validate_ringtone_filename(self.ringtone_var.get()) or DEFAULT_RINGTONE
                 alarm.update({
                     "date": date_str,
@@ -3103,8 +3087,7 @@ class EditDialog(ctk.CTkToplevel):
                     "ringtone": rt_file,
                     "enabled": True
                 })
-                if not self.master._persist_or_restore(snapshot, parent=self):
-                    return
+                save_data(self.data)
                 self.master._log_event(alarm, "Edited")
         self.destroy()
         self.master._refresh_alarm_list()
@@ -3118,17 +3101,21 @@ class EditDialog(ctk.CTkToplevel):
 
 
 if __name__ == "__main__":
-    if not acquire_single_instance():
-        try:
-            root = ctk.CTk()
-            root.withdraw()
-            messagebox.showinfo(
-                APP_NAME,
-                "TimePulse is already running. Use the existing window or tray icon.",
-                parent=root,
-            )
-            root.destroy()
-        except Exception:
-            pass
-        raise SystemExit(0)
-    TimePulse().mainloop()
+    instance_mutex_handle = acquire_single_instance_mutex()
+    if instance_mutex_handle is False:
+        print("KRONOS is already running.")
+        sys.exit(0)
+    if instance_mutex_handle is None:
+        sys.exit(1)
+
+    app = None
+    try:
+        app = AlarmApp()
+        app._instance_mutex_handle = instance_mutex_handle
+        app.mainloop()
+    finally:
+        if app:
+            release_single_instance_mutex(app._instance_mutex_handle)
+            app._instance_mutex_handle = None
+        else:
+            release_single_instance_mutex(instance_mutex_handle)

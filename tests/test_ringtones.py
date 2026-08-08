@@ -2,7 +2,7 @@ import TimePulse
 
 
 def validate(filename):
-    return TimePulse.TimePulse.validate_ringtone_filename(
+    return TimePulse.AlarmApp.validate_ringtone_filename(
         None,
         filename,
         require_exists=False,
@@ -23,5 +23,5 @@ def test_rejects_paths_and_non_wav_files():
 
 
 def test_friendly_ringtone_name():
-    result = TimePulse.TimePulse.get_friendly_name(None, "Bell_for_Seven_AM.wav")
+    result = TimePulse.AlarmApp.get_friendly_name(None, "Bell_for_Seven_AM.wav")
     assert result == "Bell for Seven AM"
