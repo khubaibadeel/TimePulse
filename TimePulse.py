@@ -12,6 +12,7 @@ import uuid
 import sys
 import tempfile
 import ctypes
+import atexit
 from ctypes import wintypes
 import getpass
 
@@ -92,6 +93,29 @@ def release_single_instance_mutex(handle):
     except Exception as exc:
         print(f"Failed to release KRONOS single-instance mutex: {exc}")
 
+
+_SINGLE_INSTANCE_HANDLE = None
+
+
+def acquire_single_instance():
+    """Acquire the hardened per-user mutex using the former TimePulse API."""
+    global _SINGLE_INSTANCE_HANDLE
+    if os.name != "nt":
+        return True
+    handle = acquire_single_instance_mutex()
+    if not handle:
+        return handle
+    _SINGLE_INSTANCE_HANDLE = handle
+    atexit.register(release_single_instance)
+    return True
+
+
+def release_single_instance():
+    """Release a mutex obtained through :func:`acquire_single_instance`."""
+    global _SINGLE_INSTANCE_HANDLE
+    if _SINGLE_INSTANCE_HANDLE:
+        release_single_instance_mutex(_SINGLE_INSTANCE_HANDLE)
+        _SINGLE_INSTANCE_HANDLE = None
 # ---------------- Configuration ----------------
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -131,6 +155,7 @@ if not os.path.exists(HISTORY_DIR):
     os.makedirs(HISTORY_DIR)
 HISTORY_FILE = os.path.join(HISTORY_DIR, "alarm_history.txt")
 DEFAULT_HASH = None # None means password protection is disabled
+DEFAULT_ALLOW_SNOOZE = True
 PASSWORD_HASH_PREFIX = "pbkdf2_sha256"
 PASSWORD_HASH_ITERATIONS = 600_000
 
@@ -296,85 +321,102 @@ def log_history_event(alarm, event):
     except Exception as e:
         print(f"Failed to log event: {e}")
 
+
+def _normalize_data(data):
+    """Validate persisted alarms and repair safe legacy omissions."""
+    if not isinstance(data, dict):
+        raise ValueError("The data root must be an object.")
+    alarms = data.get("alarms")
+    if not isinstance(alarms, list):
+        raise ValueError("'alarms' must be a list.")
+    password = data.get("password")
+    if password is not None and not isinstance(password, str):
+        raise ValueError("'password' must be null or a string.")
+    allow_snooze = data.get("allow_snooze", DEFAULT_ALLOW_SNOOZE)
+    if not isinstance(allow_snooze, bool):
+        raise ValueError("'allow_snooze' must be a boolean.")
+    normalized = dict(data)
+    normalized["password"] = password
+    normalized["allow_snooze"] = allow_snooze
+    normalized["alarms"] = []
+    seen_ids = set()
+    now = datetime.now()
+    for index, raw_alarm in enumerate(alarms):
+        if not isinstance(raw_alarm, dict):
+            raise ValueError(f"Alarm #{index + 1} must be an object.")
+        alarm = dict(raw_alarm)
+        alarm_id = alarm.get("id")
+        if not isinstance(alarm_id, str) or not alarm_id.strip() or alarm_id in seen_ids:
+            alarm_id = str(uuid.uuid4())
+            alarm["id"] = alarm_id
+        seen_ids.add(alarm_id)
+        if "datetime" not in alarm:
+            time_value = alarm.get("time")
+            if not isinstance(time_value, str):
+                raise ValueError(f"Alarm {alarm_id} has no valid time.")
+            date_value = alarm.get("date", now.strftime("%Y-%m-%d"))
+            alarm["date"] = date_value
+            alarm["datetime"] = f"{date_value}T{time_value}:00"
+        alarm_dt = parse_alarm_datetime(alarm.get("datetime"))
+        if alarm_dt is None:
+            raise ValueError(f"Alarm {alarm_id} has an invalid datetime.")
+        if "date" in alarm:
+            alarm["date"] = alarm_dt.strftime("%Y-%m-%d")
+        if "time" in alarm:
+            alarm["time"] = alarm_dt.strftime("%H:%M")
+        alarm["datetime"] = alarm_dt.strftime("%Y-%m-%dT%H:%M:%S")
+        repeat = str(alarm.get("repeat", "none")).lower()
+        if repeat not in {"none", "daily", "weekly", "monthly"}:
+            raise ValueError(f"Alarm {alarm_id} has an invalid repeat value.")
+        if "repeat" in alarm:
+            alarm["repeat"] = repeat
+        if "enabled" in alarm:
+            alarm["enabled"] = bool(alarm["enabled"])
+        if "status" in alarm:
+            alarm["status"] = str(alarm["status"])
+        if "label" in alarm:
+            alarm["label"] = str(alarm["label"])
+        if "ringtone" in alarm:
+            alarm["ringtone"] = str(alarm["ringtone"])
+        if repeat == "monthly":
+            try:
+                repeat_day = int(alarm.get("repeat_day", alarm_dt.day))
+            except (TypeError, ValueError):
+                repeat_day = alarm_dt.day
+            alarm["repeat_day"] = min(31, max(1, repeat_day))
+        if repeat == "none" and alarm.get("enabled", True) and alarm_dt < now:
+            alarm["enabled"] = False
+            alarm["status"] = "missed"
+        normalized["alarms"].append(alarm)
+    return normalized
 def load_data():
-    default_data = {"password": DEFAULT_HASH, "alarms": []}
+    default_data = {
+        "password": DEFAULT_HASH,
+        "allow_snooze": DEFAULT_ALLOW_SNOOZE,
+        "alarms": [],
+    }
     if not os.path.exists(DATA_FILE):
         return default_data
-    
+
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        
-        # Validate structure
-        if not isinstance(data, dict) or "password" not in data or "alarms" not in data:
-            raise ValueError("Invalid structure")
-        
-
-        # Migrate existing alarms to have stable IDs if missing
-        mutated = False
-        if isinstance(data.get("alarms"), list):
-            now = datetime.now()
-            for alarm in data["alarms"]:
-                if not isinstance(alarm, dict): continue
-                if "id" not in alarm:
-                    alarm["id"] = str(uuid.uuid4())
-                    mutated = True
-                # Normalize to new Date+Time format
-                if "datetime" not in alarm:
-                    if "time" in alarm:
-                        today_str = datetime.now().strftime("%Y-%m-%d")
-                        alarm["date"] = alarm.get("date", today_str)
-                        alarm["datetime"] = f"{alarm['date']}T{alarm['time']}:00"
-                    else:
-                        alarm["datetime"] = datetime.now().strftime("%Y-%m-%dT%H:%M:00")
-                    
-                    if "status" not in alarm:
-                        alarm["status"] = "scheduled"
-                    if "repeat" not in alarm:
-                        alarm["repeat"] = "none"
-                    if "created_at" not in alarm:
-                        alarm["created_at"] = datetime.now().isoformat()
-                    mutated = True
-
-                # A stale one-time alarm should remain visible as missed,
-                # rather than firing immediately when the app starts.
-                try:
-                    alarm_dt = datetime.fromisoformat(alarm.get("datetime", ""))
-                    is_past_one_time = (
-                        str(alarm.get("repeat", "none")).lower() == "none"
-                        and alarm.get("enabled", True)
-                        and alarm_dt < now
-                    )
-                except (TypeError, ValueError):
-                    is_past_one_time = False
-
-                if is_past_one_time:
-                    alarm["enabled"] = False
-                    alarm["status"] = "missed"
-                    log_history_event(
-                        alarm,
-                        "Missed - skipped because its scheduled time was in the past",
-                    )
-                    mutated = True
-
-        if mutated:
-            save_data(data)
-            
+            raw_data = json.load(f)
+        data = _normalize_data(raw_data)
+        if data != raw_data and not save_data(data):
+            print("Warning: Normalized alarm data could not be saved.")
         return data
-        
-    except (json.JSONDecodeError, ValueError, Exception) as e:
-        # Backup corrupt file
+    except (json.JSONDecodeError, OSError, ValueError, TypeError):
         try:
             backup_path = f"{DATA_FILE}.{datetime.now().strftime('%Y%m%d_%H%M%S')}.bak"
             if os.path.exists(DATA_FILE):
                 shutil.copy2(DATA_FILE, backup_path)
-        except:
+        except OSError:
             pass
         return default_data
-
 def save_data(data):
     temp_path = None
     try:
+        os.makedirs(DATA_DIR, exist_ok=True)
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
@@ -405,6 +447,12 @@ def save_data(data):
                 pass
         return False
 
+
+def get_alarm_popup_actions(allow_snooze, is_snoozed=False):
+    """Return the actions rendered for an alarm popup."""
+    if allow_snooze and not is_snoozed:
+        return ("Snooze (3m)", "Lock Now")
+    return ("Lock Now",)
 # ---------------- Windows Startup Logic ----------------
 STARTUP_FILE_NAME = "TimePulse Startup.cmd"
 LEGACY_STARTUP_FILE_NAMES = ("Alarm App Startup.cmd",)
@@ -2479,6 +2527,33 @@ class AlarmApp(ctk.CTk):
         self.password_remove_btn.pack(side="left", expand=True, fill="x", padx=(4,0))
         self._refresh_password_controls()
 
+        snooze_card = ctk.CTkFrame(f, fg_color=CARD, corner_radius=12)
+        snooze_card.pack(fill="x", pady=(0, 8))
+        snooze_text = ctk.CTkFrame(snooze_card, fg_color="transparent")
+        snooze_text.pack(side="left", fill="x", expand=True, padx=14, pady=10)
+        ctk.CTkLabel(
+            snooze_text,
+            text="Allow 3-Minute Snooze",
+            font=("Segoe UI", 13, "bold"),
+            text_color=TEXT,
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            snooze_text,
+            text="Show the Snooze (3m) option when an alarm fires.",
+            font=("Segoe UI", 10),
+            text_color=SUBTEXT,
+        ).pack(anchor="w", pady=(3, 0))
+        self.snooze_var = ctk.BooleanVar(
+            value=self.data.get("allow_snooze", DEFAULT_ALLOW_SNOOZE)
+        )
+        ctk.CTkSwitch(
+            snooze_card,
+            text="",
+            variable=self.snooze_var,
+            progress_color=SUCCESS,
+            command=self._toggle_snooze_setting,
+        ).pack(side="right", padx=14, pady=12)
+
 
         # Automatic login startup is always enabled for this application.
         as_card = ctk.CTkFrame(f, fg_color=CARD, corner_radius=12)
@@ -2501,18 +2576,34 @@ class AlarmApp(ctk.CTk):
             text_color=SUBTEXT
         ).pack(anchor="w", pady=(3, 0))
 
-        ctk.CTkLabel(
+        # The original switch affordance is retained as a status indicator.
+        # Mandatory startup must not be user-disableable in the hardened app.
+        self.auto_start_var = ctk.BooleanVar(value=True)
+        ctk.CTkSwitch(
             as_card,
             text="Enabled",
-            font=("Segoe UI", 10, "bold"),
-            text_color=SUCCESS,
-            fg_color=MUTED,
-            corner_radius=7,
-            padx=10,
-            pady=5
+            variable=self.auto_start_var,
+            state="disabled",
+            progress_color=SUCCESS,
+            button_color=SUCCESS,
         ).pack(side="right", padx=14, pady=12)
 
 
+
+    def _toggle_snooze_setting(self):
+        requested = bool(self.snooze_var.get())
+        with self.data_lock:
+            previous = self.data.get("allow_snooze", DEFAULT_ALLOW_SNOOZE)
+            self.data["allow_snooze"] = requested
+            saved = save_data(self.data)
+            if not saved:
+                self.data["allow_snooze"] = previous
+        if not saved:
+            self.snooze_var.set(previous)
+            messagebox.showerror(
+                "Save Failed",
+                "The snooze setting could not be saved. Check that the data folder is writable.",
+            )
 
     def _refresh_password_controls(self):
         password_enabled = self.data.get("password") is not None
@@ -2761,6 +2852,11 @@ class AlarmApp(ctk.CTk):
         h_s, m_s, ampm = to_12h(triggered[0]["time"])
         label = triggered[0].get("label","") or "Alarm"
         is_snoozed = triggered[0].get("snoozed", False)
+        with self.data_lock:
+            popup_actions = get_alarm_popup_actions(
+                self.data.get("allow_snooze", DEFAULT_ALLOW_SNOOZE),
+                is_snoozed,
+            )
 
         dt_obj = parse_alarm_datetime(triggered[0].get("datetime"))
         date_str = dt_obj.strftime("%d %b %Y") if dt_obj else triggered[0].get("date", "")
@@ -2895,7 +2991,7 @@ class AlarmApp(ctk.CTk):
         btn_row = ctk.CTkFrame(win, fg_color="transparent")
         btn_row.pack(fill="x", padx=36, pady=14)
 
-        if not is_snoozed:
+        if "Snooze (3m)" in popup_actions:
             btn_row.grid_columnconfigure(0, weight=1)
             btn_row.grid_columnconfigure(1, weight=1)
             ctk.CTkButton(btn_row, text="Snooze (3m)", fg_color=ACCENT, hover_color="#3730A3",
@@ -2912,6 +3008,9 @@ class AlarmApp(ctk.CTk):
         
         auto_lock_timer = win.after(30000, lambda: dismiss(True))
 
+
+# Compatibility alias for integrations built against the original TimePulse UI.
+TimePulse = AlarmApp
 
 # ---------------- Password Dialog ----------------
 class PwDialog(ctk.CTkToplevel):
