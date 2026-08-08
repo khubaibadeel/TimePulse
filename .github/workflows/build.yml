@@ -32,7 +32,7 @@ jobs:
         run: pyinstaller --clean TimePulse.spec
 
       - name: Upload executable artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: TimePulse-Windows
           path: dist/TimePulse.exe
