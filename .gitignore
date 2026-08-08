@@ -44,3 +44,5 @@ desktop.ini
 .env
 .env.*
 !.env.example
+*.exe
+*.msi

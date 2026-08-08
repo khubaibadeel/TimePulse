@@ -24,6 +24,7 @@ GWL_WNDPROC = -4
 NOTIFY_FOR_THIS_SESSION = 0
 DEFAULT_RINGTONE = "Soft_Arrival.wav"
 ERROR_ALREADY_EXISTS = 183
+# Preserve the legacy-compatible identifier so KRONOS and TimePulse cannot run together.
 MUTEX_NAME_PREFIX = "Local\\KRONOS_Alarm_"
 
 from xml.sax.saxutils import escape
@@ -34,7 +35,7 @@ from tkinter import messagebox
 import pystray
 from PIL import Image, ImageTk
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ---------------- Helpers ----------------
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
     try:
@@ -91,15 +92,15 @@ def release_single_instance_mutex(handle):
     except Exception as exc:
         print(f"Failed to release KRONOS single-instance mutex: {exc}")
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ---------------- Configuration ----------------
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def resolve_icon_path():
-    """Return the bundled or external newico.ico path."""
+    """Return the bundled or executable-side TimePulse icon path."""
     search_roots = []
 
     if getattr(sys, "frozen", False):
-        # Prefer an external icon beside Alarm.exe, then the bundled copy.
+        # Prefer an external asset beside TimePulse.exe, then the bundled copy.
         search_roots.append(os.path.dirname(sys.executable))
 
     search_roots.extend([
@@ -111,7 +112,7 @@ def resolve_icon_path():
         if not root:
             continue
 
-        candidate = os.path.join(root, "newico.ico")
+        candidate = os.path.join(root, "assets", "TimePulse.ico")
         if os.path.isfile(candidate):
             return os.path.abspath(candidate)
 
@@ -163,7 +164,7 @@ _native_icon_handles = {}
 
 def apply_window_icon(window):
     """
-    Apply newico.ico to a Tk/CustomTkinter root window or popup.
+    Apply assets/TimePulse.ico to a Tk/CustomTkinter root window or popup.
 
     WM_SETICON is used for the real Windows title-bar icon. Tk iconphoto and
     iconbitmap remain as fallbacks.
@@ -173,7 +174,7 @@ def apply_window_icon(window):
     if not ICON_PATH:
         if not _icon_warning_shown:
             print(
-                "Application icon not found. Expected newico.ico in the app folder."
+                "Application icon not found. Expected assets/TimePulse.ico."
             )
             _icon_warning_shown = True
         return
@@ -271,7 +272,7 @@ def apply_window_icon(window):
             errors.append(f"iconbitmap failed: {exc}")
 
         if len(errors) == 3 and not _icon_warning_shown:
-            print("Failed to apply newico.ico: " + " | ".join(errors))
+            print("Failed to apply assets/TimePulse.ico: " + " | ".join(errors))
             _icon_warning_shown = True
 
     # Apply after the native window is fully created. The delayed pass is
@@ -404,8 +405,9 @@ def save_data(data):
                 pass
         return False
 
-# ── Windows Startup Logic ─────────────────────────────────────────────────────
-STARTUP_FILE_NAME = "Alarm App Startup.cmd"
+# ---------------- Windows Startup Logic ----------------
+STARTUP_FILE_NAME = "TimePulse Startup.cmd"
+LEGACY_STARTUP_FILE_NAMES = ("Alarm App Startup.cmd",)
 LEGACY_TASK_NAMES = ("AlarmApp_AutoStart", "AlarmApp_AutoStart_Login")
 
 def get_app_launch_details():
@@ -448,6 +450,21 @@ def get_startup_file_path():
 def is_auto_start_enabled():
     startup_file = get_startup_file_path()
     return bool(startup_file and os.path.isfile(startup_file))
+
+
+def _remove_legacy_startup_files():
+    """Remove only exact Startup-folder filenames created by earlier app versions."""
+    startup_dir = get_startup_folder()
+    if not startup_dir:
+        return
+
+    for filename in LEGACY_STARTUP_FILE_NAMES:
+        legacy_path = os.path.join(startup_dir, filename)
+        try:
+            if os.path.isfile(legacy_path):
+                os.remove(legacy_path)
+        except Exception as exc:
+            print(f"Failed to remove legacy startup entry '{filename}': {exc}")
 
 
 def _remove_legacy_scheduled_tasks():
@@ -501,6 +518,7 @@ def enable_auto_start():
 
 def ensure_login_auto_start():
     """Ensure the app starts automatically at Windows sign-in."""
+    _remove_legacy_startup_files()
     _remove_legacy_scheduled_tasks()
 
     startup_file = get_startup_file_path()
@@ -688,7 +706,7 @@ def next_repeat_datetime(alarm, now=None):
         candidate = occurrence_after_months(months_ahead + 1)
     return candidate
 
-# ── Audio Manager and Ringtone Selector ───────────────────────────────────────
+# ---------------- Audio Manager and Ringtone Selector ----------------
 class AudioManager:
     def __init__(self, app):
         self.app = app
@@ -1098,7 +1116,7 @@ class RingtoneSelector(ctk.CTkFrame):
         super().destroy()
 
 
-# ── Main App ──────────────────────────────────────────────────────────────────
+# ---------------- Main App ----------------
 class NumberStepper(ctk.CTkFrame):
     def __init__(self, master, min_value, max_value, value, width=98, height=34, command=None):
         super().__init__(master, fg_color="transparent")
@@ -1336,7 +1354,7 @@ class DatePickerField(ctk.CTkFrame):
 class AlarmApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Alarm App")
+        self.title("TimePulse")
         width, height = 430, 650
         self.geometry(f"{width}x{height}")
         center_window(self, width, height)
@@ -1546,7 +1564,7 @@ class AlarmApp(ctk.CTk):
         
         txt_grp = ctk.CTkFrame(hdr, fg_color="transparent")
         txt_grp.pack(side="left", padx=(16, 0), pady=7)
-        ctk.CTkLabel(txt_grp, text="Alarm App", font=("Segoe UI Black", 14, "bold"), text_color=TEXT).pack(anchor="w")
+        ctk.CTkLabel(txt_grp, text="TimePulse", font=("Segoe UI Black", 14, "bold"), text_color=TEXT).pack(anchor="w")
         
         dev_lbl = ctk.CTkFrame(txt_grp, fg_color="transparent")
         dev_lbl.pack(anchor="w")
@@ -1585,7 +1603,7 @@ class AlarmApp(ctk.CTk):
                 pystray.MenuItem("Show", self._show_window, default=True),
                 pystray.MenuItem("Exit", self._quit_app)
             )
-            self.tray = pystray.Icon("Kronos", image, "KRONOS Alarm", menu)
+            self.tray = pystray.Icon("TimePulse", image, "TimePulse Alarm", menu)
             self._tray_image = image
 
             tray = self.tray
@@ -1761,13 +1779,13 @@ class AlarmApp(ctk.CTk):
 
             # Update Tray Tooltip
             try:
-                tray_msg = f"Alarm App: Next alarm in {int(min_diff // 60)} minutes"
+                tray_msg = f"TimePulse: Next alarm in {int(min_diff // 60)} minutes"
                 self.tray.title = tray_msg
             except:
                 pass
         else:
             self.next_alarm_lbl.configure(text="No upcoming alarms")
-            try: self.tray.title = "Alarm App: No alarms"
+            try: self.tray.title = "TimePulse: No alarms"
             except: pass
     def _build_tabs(self):
         bar = ctk.CTkFrame(self, fg_color=CARD, corner_radius=10, height=42)
@@ -1796,8 +1814,7 @@ class AlarmApp(ctk.CTk):
             self._refresh_alarm_list()
         elif key == "settings":
             self._refresh_password_controls()
-
-    # ── Alarms Tab ───────────────────────────────────────────────────────────
+    # ---------------- Alarms Tab ----------------
     def _build_alarm_tab(self):
         f = ctk.CTkFrame(self, fg_color="transparent")
         self.tab_frames["alarms"] = f
@@ -2419,8 +2436,7 @@ class AlarmApp(ctk.CTk):
                                 command=lambda m=mins: self._add_timer_alarm(m))
             btn.grid(row=i//2, column=i%2, padx=4, pady=4, sticky="ew")
         grid.columnconfigure((0, 1), weight=1)
-
-    # ── Settings Tab ─────────────────────────────────────────────────────────
+    # ---------------- Settings Tab ----------------
     def _build_settings_tab(self):
         f = ctk.CTkScrollableFrame(self, fg_color="transparent", scrollbar_button_color=BORDER)
         self.tab_frames["settings"] = f
@@ -2667,8 +2683,7 @@ class AlarmApp(ctk.CTk):
 
     def _log_event(self, alarm, event):
         log_history_event(alarm, event)
-
-    # ── Alarm Checker ────────────────────────────────────────────────────────
+    # ---------------- Alarm Checker ----------------
     def _start_alarm_checker(self):
         if self._alarm_check_running:
             return
@@ -2898,7 +2913,7 @@ class AlarmApp(ctk.CTk):
         auto_lock_timer = win.after(30000, lambda: dismiss(True))
 
 
-# ── Password Dialog ───────────────────────────────────────────────────────────
+# ---------------- Password Dialog ----------------
 class PwDialog(ctk.CTkToplevel):
     def __init__(
         self,
@@ -2962,7 +2977,7 @@ class PwDialog(ctk.CTkToplevel):
         self.destroy()
 
 
-# ── Edit Dialog ───────────────────────────────────────────────────────────────
+# ---------------- Edit Dialog ----------------
 class EditDialog(ctk.CTkToplevel):
     def __init__(self, parent, data, alarm_id):
         super().__init__(parent)
