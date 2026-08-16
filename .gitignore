@@ -13,8 +13,6 @@ venv/
 env/
 
 # Packaging
-build/
-dist/
 *.egg-info/
 *.manifest
 *.log
@@ -44,5 +42,4 @@ desktop.ini
 .env
 .env.*
 !.env.example
-*.exe
 *.msi
