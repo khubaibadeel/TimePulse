@@ -33,7 +33,7 @@ def test_save_and_load_round_trip(monkeypatch, tmp_path):
 
     assert TimePulse.save_data(data)
     assert data_file.exists()
-    assert TimePulse.load_data() == data
+    assert TimePulse.load_data() == {**data, "protect_edit_delete": True}
 
 
 
@@ -111,6 +111,7 @@ def test_corrupt_data_is_backed_up(monkeypatch, tmp_path):
     assert TimePulse.load_data() == {
         "password": None,
         "allow_snooze": True,
+        "protect_edit_delete": True,
         "alarms": [],
     }
     backups = list(tmp_path.glob("alarms.json.*.bak"))
