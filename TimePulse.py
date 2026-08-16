@@ -156,6 +156,7 @@ if not os.path.exists(HISTORY_DIR):
 HISTORY_FILE = os.path.join(HISTORY_DIR, "alarm_history.txt")
 DEFAULT_HASH = None # None means password protection is disabled
 DEFAULT_ALLOW_SNOOZE = True
+DEFAULT_PROTECT_EDIT_DELETE = True
 PASSWORD_HASH_PREFIX = "pbkdf2_sha256"
 PASSWORD_HASH_ITERATIONS = 600_000
 
@@ -335,9 +336,13 @@ def _normalize_data(data):
     allow_snooze = data.get("allow_snooze", DEFAULT_ALLOW_SNOOZE)
     if not isinstance(allow_snooze, bool):
         raise ValueError("'allow_snooze' must be a boolean.")
+    protect_edit_delete = data.get("protect_edit_delete", DEFAULT_PROTECT_EDIT_DELETE)
+    if not isinstance(protect_edit_delete, bool):
+        raise ValueError("'protect_edit_delete' must be a boolean.")
     normalized = dict(data)
     normalized["password"] = password
     normalized["allow_snooze"] = allow_snooze
+    normalized["protect_edit_delete"] = protect_edit_delete
     normalized["alarms"] = []
     seen_ids = set()
     now = datetime.now()
@@ -393,6 +398,7 @@ def load_data():
     default_data = {
         "password": DEFAULT_HASH,
         "allow_snooze": DEFAULT_ALLOW_SNOOZE,
+        "protect_edit_delete": DEFAULT_PROTECT_EDIT_DELETE,
         "alarms": [],
     }
     if not os.path.exists(DATA_FILE):
@@ -453,6 +459,11 @@ def get_alarm_popup_actions(allow_snooze, is_snoozed=False):
     if allow_snooze and not is_snoozed:
         return ("Snooze (3m)", "Lock Now")
     return ("Lock Now",)
+
+
+def requires_alarm_change_auth(protect_edit_delete):
+    """Return whether edit and delete actions require authentication."""
+    return bool(protect_edit_delete)
 # ---------------- Windows Startup Logic ----------------
 STARTUP_FILE_NAME = "TimePulse Startup.cmd"
 LEGACY_STARTUP_FILE_NAMES = ("Alarm App Startup.cmd",)
@@ -1551,11 +1562,17 @@ class AlarmApp(ctk.CTk):
             self._session_notifications_registered = True
 
             def wnd_proc(hwnd, msg, wparam, lparam):
-                if msg == WM_WTSSESSION_CHANGE and wparam == WTS_SESSION_LOCK:
-                    try:
-                        self.after(0, self._on_session_lock)
-                    except Exception as exc:
-                        print(f"Failed to schedule session-lock cleanup: {exc}")
+                if msg == WM_WTSSESSION_CHANGE:
+                    session_callback = None
+                    if wparam == WTS_SESSION_LOCK:
+                        session_callback = self._on_session_lock
+                    elif wparam == WTS_SESSION_UNLOCK:
+                        session_callback = self._on_session_unlock
+                    if session_callback:
+                        try:
+                            self.after(0, session_callback)
+                        except Exception as exc:
+                            print(f"Failed to schedule session-change handling: {exc}")
                 if self.original_wndproc:
                     return ctypes.windll.user32.CallWindowProcW(self.original_wndproc, hwnd, msg, wparam, lparam)
                 return ctypes.windll.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -1603,8 +1620,19 @@ class AlarmApp(ctk.CTk):
             self._wndproc_cb = None
 
     def _on_session_lock(self):
+        """Stop transient audio only; a workstation lock is not an app exit."""
+        if self._shutting_down:
+            return
         if hasattr(self, 'audio_manager'):
             self.audio_manager.stop_all()
+
+    def _on_session_unlock(self):
+        """Restore non-native runtime services after a session transition."""
+        if self._shutting_down:
+            return
+        self._ensure_alarm_checker_running()
+        if not self._session_notifications_registered:
+            self._setup_session_notifications()
 
     def _build_header(self):
         hdr = ctk.CTkFrame(self, fg_color=CARD, corner_radius=0, height=50)
@@ -1671,7 +1699,7 @@ class AlarmApp(ctk.CTk):
                     self._tray_ready_event.set()
                     print(f"Tray error: {exc}")
 
-            self._tray_thread = threading.Thread(target=run_tray, daemon=True)
+            self._tray_thread = threading.Thread(target=run_tray, daemon=False)
             self._tray_thread.start()
             if self._tray_ready_event.wait(1) and not self._tray_failed:
                 self._tray_ready = True
@@ -1725,11 +1753,24 @@ class AlarmApp(ctk.CTk):
         if self._shutting_down:
             return
         self._shutdown_cleanup()
-        if self.tray:
-            self.tray.stop()
-            self.tray = None
-        self._tray_ready = False
+        self._stop_tray_for_shutdown()
         self.destroy()
+
+    def _stop_tray_for_shutdown(self):
+        """Stop and join the one native tray loop before Tk is destroyed."""
+        tray = self.tray
+        tray_thread = self._tray_thread
+        try:
+            if tray:
+                tray.stop()
+        except Exception as exc:
+            print(f"Failed to stop tray: {exc}")
+        finally:
+            if tray_thread and tray_thread is not threading.current_thread():
+                tray_thread.join(timeout=2)
+            self.tray = None
+            self._tray_ready = False
+            self._tray_thread = None
 
     def _shutdown_cleanup(self):
         if self._shutting_down:
@@ -2298,7 +2339,7 @@ class AlarmApp(ctk.CTk):
         ctk.CTkButton(right, text="Edit", width=50, height=30, corner_radius=7,
                       fg_color=BORDER, hover_color=ACCENT, text_color=TEXT,
                       font=("Segoe UI", 10, "bold"),
-                      command=lambda aid=alarm_id: self._auth_then(self._edit_alarm, aid)
+                      command=lambda aid=alarm_id: self._edit_with_auth(aid)
                       ).pack(side="left", padx=3)
         ctk.CTkButton(right, text="X", width=32, height=30, corner_radius=7,
                       fg_color=BORDER, hover_color=DANGER, text_color=TEXT,
@@ -2307,11 +2348,20 @@ class AlarmApp(ctk.CTk):
                       ).pack(side="left", padx=3)
 
     def _delete_with_auth(self, alarm_id):
-        self._auth_then(
-            self._delete_alarm,
-            alarm_id,
-            message="Secure deletion requires your configured password.",
-        )
+        if requires_alarm_change_auth(self.data.get("protect_edit_delete")):
+            self._auth_then(
+                self._delete_alarm,
+                alarm_id,
+                message="Secure deletion requires your configured password.",
+            )
+        else:
+            self._delete_alarm(alarm_id)
+
+    def _edit_with_auth(self, alarm_id):
+        if requires_alarm_change_auth(self.data.get("protect_edit_delete")):
+            self._auth_then(self._edit_alarm, alarm_id)
+        else:
+            self._edit_alarm(alarm_id)
 
     def _delete_history_with_auth(self):
         self._auth_then(
@@ -2371,8 +2421,8 @@ class AlarmApp(ctk.CTk):
         self._refresh_alarm_list()
         self._close_new_alarm_popup()
 
-    def _auth_then(self, callback, *args, message=None):
-        # Skip if password is disabled
+    def _auth_then(self, callback, *args, message=None, on_cancel=None):
+        # Skip if password is disabled.
         if self.data.get("password") is None:
             callback(*args)
             return
@@ -2383,25 +2433,19 @@ class AlarmApp(ctk.CTk):
         if message is not None:
             dialog_options["message"] = message
 
-        # If it's a toggle, we need a way to revert the switch if auth fails/closes
-        if callback == self._toggle_alarm and len(args) > 1:
+        # CustomTkinter updates a switch before its command runs, so preserve
+        # the existing alarm-toggle rollback behavior when no callback is given.
+        if on_cancel is None and callback == self._toggle_alarm and len(args) > 1:
             switch_var = args[1]
-            def on_cancel():
-                switch_var.set(not switch_var.get())
-            PwDialog(
-                self,
-                self.data["password"],
-                lambda: callback(*args),
-                on_cancel,
-                **dialog_options,
-            )
-        else:
-            PwDialog(
-                self,
-                self.data["password"],
-                lambda: callback(*args),
-                **dialog_options,
-            )
+            on_cancel = lambda: switch_var.set(not switch_var.get())
+
+        PwDialog(
+            self,
+            self.data["password"],
+            lambda: callback(*args),
+            on_cancel,
+            **dialog_options,
+        )
 
     def _upgrade_password_hash(self, upgraded_hash):
         with self.data_lock:
@@ -2527,6 +2571,35 @@ class AlarmApp(ctk.CTk):
         self.password_remove_btn.pack(side="left", expand=True, fill="x", padx=(4,0))
         self._refresh_password_controls()
 
+        protection_card = ctk.CTkFrame(f, fg_color=CARD, corner_radius=12)
+        protection_card.pack(fill="x", pady=(0, 8))
+        protection_text = ctk.CTkFrame(protection_card, fg_color="transparent")
+        protection_text.pack(side="left", fill="x", expand=True, padx=14, pady=10)
+        ctk.CTkLabel(
+            protection_text,
+            text="Password Protect Edit & Delete",
+            font=("Segoe UI", 13, "bold"),
+            text_color=TEXT,
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            protection_text,
+            text="Require your password before editing or deleting alarms.",
+            font=("Segoe UI", 10),
+            text_color=SUBTEXT,
+        ).pack(anchor="w", pady=(3, 0))
+        self.protect_edit_delete_var = ctk.BooleanVar(
+            value=self.data.get(
+                "protect_edit_delete", DEFAULT_PROTECT_EDIT_DELETE
+            )
+        )
+        ctk.CTkSwitch(
+            protection_card,
+            text="",
+            variable=self.protect_edit_delete_var,
+            progress_color=SUCCESS,
+            command=self._toggle_protect_edit_delete_setting,
+        ).pack(side="right", padx=14, pady=12)
+
         snooze_card = ctk.CTkFrame(f, fg_color=CARD, corner_radius=12)
         snooze_card.pack(fill="x", pady=(0, 8))
         snooze_text = ctk.CTkFrame(snooze_card, fg_color="transparent")
@@ -2591,18 +2664,54 @@ class AlarmApp(ctk.CTk):
 
 
     def _toggle_snooze_setting(self):
-        requested = bool(self.snooze_var.get())
+        self._authenticate_boolean_setting_change(
+            "allow_snooze",
+            self.snooze_var,
+            DEFAULT_ALLOW_SNOOZE,
+            "Allow 3-Minute Snooze",
+        )
+
+    def _toggle_protect_edit_delete_setting(self):
+        self._authenticate_boolean_setting_change(
+            "protect_edit_delete",
+            self.protect_edit_delete_var,
+            DEFAULT_PROTECT_EDIT_DELETE,
+            "Password Protect Edit & Delete",
+        )
+
+    def _authenticate_boolean_setting_change(
+        self, setting_key, switch_var, default, setting_name
+    ):
+        requested = bool(switch_var.get())
         with self.data_lock:
-            previous = self.data.get("allow_snooze", DEFAULT_ALLOW_SNOOZE)
-            self.data["allow_snooze"] = requested
+            previous = self.data.get(setting_key, default)
+        if requested == previous:
+            return
+
+        self._auth_then(
+            self._save_boolean_setting,
+            setting_key,
+            requested,
+            previous,
+            switch_var,
+            setting_name,
+            message=f"Changing {setting_name} requires your configured password.",
+            on_cancel=lambda: switch_var.set(previous),
+        )
+
+    def _save_boolean_setting(
+        self, setting_key, requested, previous, switch_var, setting_name
+    ):
+        with self.data_lock:
+            self.data[setting_key] = requested
             saved = save_data(self.data)
             if not saved:
-                self.data["allow_snooze"] = previous
+                self.data[setting_key] = previous
         if not saved:
-            self.snooze_var.set(previous)
+            switch_var.set(previous)
             messagebox.showerror(
                 "Save Failed",
-                "The snooze setting could not be saved. Check that the data folder is writable.",
+                f"{setting_name} could not be saved. Check that the data folder is writable.",
             )
 
     def _refresh_password_controls(self):
@@ -2782,6 +2891,18 @@ class AlarmApp(ctk.CTk):
         self.fired_alarms_this_minute = set()
         self.last_check_minute = -1
         self._schedule_alarm_check()
+
+    def _ensure_alarm_checker_running(self):
+        """Restore the recurring checker if a session transition interrupted it."""
+        if self._shutting_down:
+            return False
+        if self._alarm_check_after_id is not None:
+            return True
+        if self._alarm_check_running:
+            self._schedule_alarm_check()
+        else:
+            self._start_alarm_checker()
+        return self._alarm_check_after_id is not None
 
     def _schedule_alarm_check(self):
         if self._shutting_down:

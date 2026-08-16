@@ -1,0 +1,10 @@
+
+
+Use Powershell:
+
+
+Remove-Item -Recurse -Force build -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force __pycache__ -ErrorAction SilentlyContinue
+
+python -m PyInstaller --clean --noconfirm TimePulse.spec
